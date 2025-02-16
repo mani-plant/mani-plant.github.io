@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+    <title>WebCL.js shit matrix example</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        :root[data-theme="light"] {
+            --bg-color: #ffffff;
+            --text-color: #000000;
+            --output-bg: #f5f5f5;
+            --border-color: #ccc;
+            --success-color: #008000;  /* Darker green for light mode */
+            --error-color: #cc0000;    /* Darker red for light mode */
+            --warning-color: #cc7700;   /* Darker orange for light mode */
+        }
+        
+        :root[data-theme="dark"] {
+            --bg-color: #1a1a1a;
+            --text-color: #ffffff;
+            --output-bg: #2d2d2d;
+            --border-color: #444;
+            --success-color: #44ff44;  /* Bright green for dark mode */
+            --error-color: #ff4444;    /* Bright red for dark mode */
+            --warning-color: #ffaa00;   /* Bright orange for dark mode */
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            transition: background-color 0.3s, color 0.3s;
+        }
+
+
+        #theme-toggle {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 36px;
+            height: 36px;
+            background-color: var(--output-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 50%;
+            cursor: pointer;
+            transition: all 0.3s;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            color: var(--text-color);
+        }
+
+        #theme-toggle:hover {
+            opacity: 0.8;
+        }
+
+        /* Hide the initial icon */
+        #theme-toggle i {
+            display: none;
+        }
+
+        /* Show appropriate icon based on theme */
+        [data-theme="dark"] #theme-toggle .fa-sun,
+        [data-theme="light"] #theme-toggle .fa-moon {
+            display: inline-block;
+        }
+
+        #output {
+            font-family: monospace;
+            white-space: pre;
+            padding: 10px;
+            border-top: 1px solid var(--border-color);
+            background: var(--output-bg);
+            max-height: 300px;
+            overflow-y: auto;
+            transition: background-color 0.3s, border-color 0.3s;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            margin: 0;
+            z-index: 1000;
+        }
+
+        #output.collapsed {
+            display: none;
+        }
+
+        #output-header {
+            position: fixed;
+            bottom: 320px;
+            left: 0;
+            right: 0;
+            padding: 5px 10px;
+            background: var(--output-bg);
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 1000;
+        }
+
+        #output-header.collapsed {
+            bottom: 0;
+        }
+
+        #output-header button {
+            background: none;
+            border: none;
+            color: var(--text-color);
+            cursor: pointer;
+            padding: 5px;
+        }
+
+        #output-header button:hover {
+            opacity: 0.8;
+        }
+
+        .error { color: var(--error-color); }
+        .warning { color: var(--warning-color); }
+        .success { color: var(--success-color); }
+    </style>
+</head>
+<body>
+    <button id="theme-toggle" aria-label="Toggle theme">
+        <i class="fa-solid fa-sun"></i>
+        <i class="fa-solid fa-moon"></i>
+    </button>
+    <div><h3>Each color channel runs idependent Conways Game of Life</h3></div>
+    <canvas id="canvas" style="border: 1px solid var(--border-color);" width="600" height="600"></canvas>
+    <div id="output-header" class="collapsed">
+        <span>Console Output</span>
+        <button id="toggle-output" aria-label="Toggle console">
+            <i class="fa-solid fa-chevron-up"></i>
+        </button>
+    </div>
+    <div id="output" class="collapsed"></div>
+    <script>
+        // Theme management
+        function setTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+            
+            // Save theme preference in cookie (expires in 1 year)
+            const date = new Date();
+            date.setFullYear(date.getFullYear() + 1);
+            document.cookie = `theme=${theme};expires=${date.toUTCString()};path=/`;
+        }
+
+        function getThemeFromCookie() {
+            const cookies = document.cookie.split(';');
+            for (let cookie of cookies) {
+                const [name, value] = cookie.trim().split('=');
+                if (name === 'theme') return value;
+            }
+            return 'dark'; // Default theme
+        }
+
+        // Initialize theme from cookie
+        setTheme(getThemeFromCookie());
+
+        // Theme toggle handler
+        document.getElementById('theme-toggle').addEventListener('click', () => {
+            const currentTheme = document.documentElement.getAttribute('data-theme');
+            setTheme(currentTheme === 'dark' ? 'light' : 'dark');
+        });
+
+        // Keep track of original console methods
+        const originalConsole = {
+            log: console.log.bind(console),
+            error: console.error.bind(console),
+            warn: console.warn.bind(console),
+            info: console.info.bind(console)
+        };
+
+        // Flag to prevent recursive logging
+        let isLogging = false;
+
+        // Unified logging function
+        function logToOutput(type, ...args) {
+            if (isLogging) return; // Prevent recursive logging
+            isLogging = true;
+
+            try {
+                const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+                const msg = args.map(arg => 
+                    typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+                ).join(' ');
+                
+                const output = document.getElementById('output');
+                const line = `[${timestamp}] [${type}] ${msg}`;
+                
+                // Add to browser output with color
+                let color = '';
+                switch(type) {
+                    case 'ERROR': color = 'error'; break;
+                    case 'WARNING': color = 'warning'; break;
+                    case 'SUCCESS': color = 'success'; break;
+                }
+                
+                output.innerHTML += `\n<span class="${color}">${line}</span>`;
+                output.scrollTop = output.scrollHeight;
+
+                // Log to original console with appropriate method
+                switch(type) {
+                    case 'ERROR': originalConsole.error(...args); break;
+                    case 'WARNING': originalConsole.warn(...args); break;
+                    default: originalConsole.log(...args);
+                }
+            } finally {
+                isLogging = false;
+            }
+        }
+
+        // Override console methods
+        console.log = (...args) => logToOutput('LOG', ...args);
+        console.error = (...args) => logToOutput('ERROR', ...args);
+        console.warn = (...args) => logToOutput('WARNING', ...args);
+        console.info = (...args) => logToOutput('INFO', ...args);
+
+        // var Module = {
+        //     canvas: document.getElementById('canvas'),
+        //     onRuntimeInitialized: function() {
+        //         logToOutput('SUCCESS', 'WASM Runtime initialized');
+        //     },
+        //     print: function(text) {
+        //         logToOutput('stdout', text);
+        //     },
+        //     printErr: function(text) {
+        //         logToOutput('stderr', text);
+        //     },
+        //     onAbort: function(what) {
+        //         logToOutput('ERROR', 'WASM Aborted:', what);
+        //     }
+        // };
+
+        // Global error handling
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+            logToOutput('ERROR', `${msg}\nAt: ${url}:${lineNo}:${columnNo}`, error);
+            return false;
+        };
+
+        // Unhandled promise rejection handling
+        window.onunhandledrejection = function(event) {
+            logToOutput('ERROR', 'Unhandled Promise Rejection:', event.reason);
+        };
+
+        // Add output toggle functionality
+        const outputDiv = document.getElementById('output');
+        const outputHeader = document.getElementById('output-header');
+        const toggleButton = document.getElementById('toggle-output');
+        
+        toggleButton.addEventListener('click', () => {
+            outputDiv.classList.toggle('collapsed');
+            outputHeader.classList.toggle('collapsed');
+            const icon = toggleButton.querySelector('i');
+            icon.classList.toggle('fa-chevron-down');
+            icon.classList.toggle('fa-chevron-up');
+        });
+    </script>
+	<script type="module">
+		import {GPU} from './WebCL.js';
+		var canvas = document.getElementById('canvas');
+		var myGPU = new GPU(canvas);
+        const grid_size = 64;
+        let initial_state = new Array(grid_size).fill(0).map(
+            () => new Array(grid_size).fill(0).map(
+                () => [Math.random() > 0.5 ? 1 : 0, Math.random() > 0.25 ? 1 : 0, Math.random() > 0.75 ? 1 : 0, 1]
+            )
+        );
+        let buf1 = new myGPU.Buffer([grid_size, grid_size, 4], initial_state);
+		let buf2 = new myGPU.Buffer([grid_size, grid_size, 4], initial_state);
+		buf1.alloc();
+		buf2.alloc();
+		let matProg = new myGPU.Program([buf1.shape], [buf2.shape], 
+		`
+        float ix = _webcl_index[0];
+        float iy = _webcl_index[1];
+        float iz = _webcl_index[2];
+        float is_ca = step(iz, 2.5);
+        float is_not_ca = step(2.5, is_ca);
+        float alive_count = _webcl_readIn0(mod(ix+1., ${grid_size}.),iy, iz) + 
+                            _webcl_readIn0(mod(ix-1., ${grid_size}.),iy, iz) + 
+                            _webcl_readIn0(ix,mod(iy+1., ${grid_size}.), iz) + 
+                            _webcl_readIn0(ix,mod(iy-1., ${grid_size}.), iz) + 
+                            _webcl_readIn0(mod(ix+1., ${grid_size}.),mod(iy+1., ${grid_size}.), iz) + 
+                            _webcl_readIn0(mod(ix+1., ${grid_size}.),mod(iy-1., ${grid_size}.), iz) + 
+                            _webcl_readIn0(mod(ix-1., ${grid_size}.),mod(iy+1., ${grid_size}.), iz) + 
+                            _webcl_readIn0(mod(ix-1., ${grid_size}.),mod(iy-1., ${grid_size}.), iz);
+        float neighbour_state = step(1.5, alive_count) * step(alive_count, 3.5);
+        float me_alive = step(0.5, _webcl_readIn0(ix, iy, iz));
+        float me_dead = step(me_alive, 0.5);
+        float birth_state = step(2.5, alive_count) * step(alive_count, 3.5);
+        float op = (me_alive * neighbour_state) + (me_dead * birth_state);
+        _webcl_commitOut0((op*is_ca) + (is_not_ca));
+		`
+		);
+        let frameCount = 0;
+        let in_buf  = buf1;
+        let out_buf = buf2;
+        let prevtimestamp = 0;
+        function frame(timestamp){
+            matProg.exec([in_buf], [out_buf]);
+            frameCount++;
+            if(frameCount > 10000){
+                console.log('done');
+                out_buf.read();
+                console.log(out_buf.getShapedData());
+                console.log(in_buf.getShapedData());
+                console.log(in_buf, out_buf);
+                return;
+            }
+            let temp = in_buf;
+            in_buf  = out_buf;
+            out_buf = temp;
+            let delta = timestamp - prevtimestamp;
+            if(delta >= 50){
+                requestAnimationFrame(frame);
+            }else{
+                setTimeout(() => requestAnimationFrame(frame), 50-delta);
+            }
+            // requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+
+		// console.log(matBuf1, matBuf2, matSq);
+		// matSq.read();
+		// console.log(matSq.data);
+	</script>
+		
+</body>
+</html> 

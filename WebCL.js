@@ -1,341 +1,412 @@
-function GPU(ctx = null, log = false){
-	this.log = log;
-	//this.log=true;
-	var gpu = this;
-	var settings = {'autocompile': true};
-	this.setSettings = function(newsettings){
-		for(s in newsettings){
-			settings[s] = newsettings[s];
-		}
+function initGL(canvas){
+	let gl = canvas.getContext("webgl2", {
+		alpha: false, 
+		depth: false,
+		stencil: false,
+		desynchronized: true,
+		antialias: false,
+		failIfMajorPerformanceCaveat: false,
+		powerPreference: "default", // "high-performance , low-power"
+		premultipliedAlpha: true,
+		preserveDrawingBuffer: false,
+		xrCompatible: false
+	});
+	if(!gl){
+		throw new Error("Unable to initialize WebGL2.");
 	}
-	var initGL = function(canvas) {
-		var gl = null;
-		var attr = {alpha : false, antialias : false};
-		gl = canvas.getContext("webgl2", attr);
-		if (!gl)
-			throw new Error("Unable to initialize WebGL2.");
-		return gl;
-	}
-	this.ctx = ctx;
-	if(this.ctx == null)
-		this.ctx = document.createElement('canvas');
-		
-	var gl = initGL(this.ctx);
-	if (!(flext = gl.getExtension('EXT_color_buffer_float')))
+	if (!gl.getExtension('EXT_color_buffer_float')){
 		throw new Error('Error: EXT_color_buffer_float not supported.');
-	var max_texture_size = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-	var max_texture_units = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS);
-	var max_color_units = gl.getParameter(gl.MAX_COLOR_ATTACHMENTS);
+	}
+	return gl;
+}
+
+function getTexSize(size){
+	return Math.ceil(Math.sqrt(size/4));
+}
+function flattenArray(arr, shape) {
+	if (!Array.isArray(arr)) return [arr];
+	
+	let result = [];
+	if (shape.length === 1) {
+		return arr;
+	}
+	
+	for (let i = 0; i < arr.length; i++) {
+		result = result.concat(flattenArray(arr[i], shape.slice(1)));
+	}
+	return result;
+}
+function getShapedArraySize(shape){
+	let size = 1;
+	for(let i=0;i<shape.length;i++){
+		size *= shape[i];
+	}
+	return size;
+}
+
+function generateIndexMacro(shape, suffix = '') {
+    // Generate stride calculations
+    let strides = [];
+    let stride = 1;
+    for (let i = shape.length - 1; i >= 0; i--) {
+        strides.unshift(stride);
+        stride *= shape[i];
+    }
+    
+    // Create macro
+    let macro = `#define _webcl_getFlatIndex${suffix}(`;
+    
+    // Add index parameters
+    for (let i = 0; i < shape.length; i++) {
+        macro += `i${i}${i < shape.length-1 ? ',' : ''} `;
+    }
+    macro += ') (';
+    
+    // Add index calculation
+    macro += shape.map((_, i) => 
+        `(i${i}) * ${strides[i]}.`
+    ).join(' + ');
+    
+    macro += ')';
+    return macro;
+}
+function generateShapedIndexMacro(shape, suffix = '') {
+    // Calculate strides for each dimension
+    let strides = [];
+    let stride = 1;
+    // Walk backwards through the shape array to compute strides (e.g., for [a,b,c], strides[0] = b*c, strides[1] = c, strides[2] = 1)
+    for (let i = shape.length - 1; i >= 0; i--) {
+        strides.unshift(stride);
+        stride *= shape[i];
+    }
+    
+    // Begin macro definition.
+    // The resulting macro will have (1 + shape.length) parameters: the flat index and one output per dimension.
+    let macro = `#define _webcl_getShapedIndex${suffix}(flat_index, shaped_index) do { \\\n`;
+	macro +=	`float _rem = (flat_index); \\\n`;
+    
+    // For each dimension, compute the index and update _rem.
+    for (let i = 0; i < shape.length; i++) {
+        if (i < shape.length - 1) {
+            macro += `    shaped_index[${i}] = floor(_rem / (${strides[i]}.)); \\\n`;
+            macro += `    _rem = mod(_rem, (${strides[i]}.)); \\\n`;
+        } else {
+            // For the last dimension, _rem is the result.
+            macro += `    shaped_index[${i}] = _rem; \\\n`;
+        }
+    }
+    macro += `} while(false)\n`;
+    return macro;
+}
+function generateNextShapedIndexMacro(shape, suffix = '') {
+    const dims = shape.length;
+    let macro = `#define _webcl_nextShapedIndex${suffix}(shaped_index) do { \\\n`;
+    
+    // Start with a carry of 1.0, since we want to add one to the index.
+    macro += "    float _carry = 1.0; \\\n";
+    
+    // For each dimension, from the last (least-significant) to the first:
+    for (let d = dims - 1; d >= 0; d--) {
+        macro += "    { \\\n";
+        // Compute a temporary value (the old index plus the current carry)
+        macro += `        float _tmp = shaped_index[${d}] + _carry; \\\n`;
+        // New value is the remainder of _tmp divided by the size in that dimension
+        macro += `        shaped_index[${d}] = mod(_tmp, (${shape[d]}.)); \\\n`;
+        // Carry is the quotient of _tmp divided by shape[d]
+        macro += `        _carry = floor(_tmp / (${shape[d]}.)); \\\n`;
+        macro += "    } \\\n";
+    }
+    
+    macro += "} while(false)";
+    return macro;
+}
+
+function unflattenArray(flatArr, shape) {
+    // Base case: 1D array
+    if (shape.length === 1) {
+        return Array.from(flatArr.slice(0, shape[0]));
+    }
+    
+    // Recursive case: create sub-arrays
+    const result = [];
+    const subArraySize = shape.slice(1).reduce((a, b) => a * b, 1);
+    
+    for (let i = 0; i < shape[0]; i++) {
+        const start = i * subArraySize;
+        const subArray = flatArr.slice(start, start + subArraySize);
+        result.push(unflattenArray(subArray, shape.slice(1)));
+    }
+    
+    return result;
+}
+
+export function GPU(canvas = null){
+	let gl = initGL(canvas || document.createElement('canvas'));
+
+	function getFrameBufferStatusMsg(frameBufferStatus){
+		if(frameBufferStatus == gl.FRAMEBUFFER_COMPLETE) return 'The framebuffer is ready to display.';
+		if(frameBufferStatus == gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT) return 'The attachment types are mismatched or not all framebuffer attachment points are framebuffer attachment complete.';
+		if(frameBufferStatus == gl.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT) return 'There is no attachment.';
+		if(frameBufferStatus == gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS) return 'Height and width of the attachment are not the same.';
+		if(frameBufferStatus == gl.FRAMEBUFFER_UNSUPPORTED) return 'The format of the attachment is not supported or if depth and stencil attachments are not the same renderbuffer.';
+		// When using a WebGL 2 context, the following values can be returned additionally:
+		// gl.FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: The values of gl.RENDERBUFFER_SAMPLES are different among attached renderbuffers, or are non-zero if the attached images are a mix of renderbuffers and textures.
+		// When using the OVR_multiview2 extension, the following value can be returned additionally:
+		// ext.FRAMEBUFFER_INCOMPLETE_VIEW_TARGETS_OVR: If baseViewIndex is not the same for all framebuffer attachment points where the value of FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE is not NONE, the framebuffer is considered incomplete
+		return 'unknown status';
+	}
+  
+	let maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+	let maxTextureUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS);
+	let maxColorUnits = gl.getParameter(gl.MAX_COLOR_ATTACHMENTS);
 	function newBuffer(data, f, e) {
-		var buf = gl.createBuffer();
+		let buf = gl.createBuffer();
 		gl.bindBuffer((e || gl.ARRAY_BUFFER), buf);
 		gl.bufferData((e || gl.ARRAY_BUFFER), new (f || Float32Array)(data), gl.STATIC_DRAW);
 		return buf;
 	}
-	var chnlMap = {
-		1:{
-			internal_format: gl.R32F,
-			format: gl.RED,
-			type: gl.FLOAT,
-			stype: 'float'
-		},
-		2:{
-			internal_format: gl.RG32F,
-			format: gl.RG,
-			type: gl.FLOAT,
-			stype: 'vec2'
-		},
-		3:{
-			internal_format: gl.RGB32F,
-			format: gl.RGB,
-			type: gl.FLOAT,
-			stype: 'vec3'
-		},
-		4:{
-			internal_format: gl.RGBA32F,
-			format: gl.RGBA,
-			type: gl.FLOAT,
-			stype: 'vec4'
-		}
-	}
-	console.log(chnlMap);
-	var positionBuffer = newBuffer([ -1, -1, 1, -1, 1, 1, -1, 1 ]);
-	var textureBuffer  = newBuffer([  0,  0, 1,  0, 1, 1,  0, 1 ]);
-	var indexBuffer    = newBuffer([  1,  2, 0,  3, 0, 2 ], Uint16Array, gl.ELEMENT_ARRAY_BUFFER);
-	var vertexShaderCode = "#version 300 es"+
+	let positionBuffer = newBuffer([ -1, -1, 1, -1, 1, 1, -1, 1 ]);
+	let textureBuffer  = newBuffer([  0,  0, 1,  0, 1, 1,  0, 1 ]);
+	let indexBuffer    = newBuffer([  1,  2, 0,  3, 0, 2 ], Uint16Array, gl.ELEMENT_ARRAY_BUFFER);
+	
+	let vertexShaderCode = "#version 300 es"+
 	"\n"+
-	"in vec2 position;\n" +
-	"out vec2 pos;\n" +
-	"in vec2 texture;\n" +
+	"precision highp float;\n"+
+	"in vec2 _webcl_position;\n" +
+	"out vec2 _webcl_pos;\n" +
+	"in vec2 _webcl_texture;\n" +
 	"\n" +
 	"void main(void) {\n" +
-	"  pos = texture;\n" +
-	"  gl_Position = vec4(position.xy, 0.0, 1.0);\n" +
+	"  _webcl_pos = _webcl_texture;\n" +
+	"  gl_Position = vec4(_webcl_position.xy, 0.0, 1.0);\n" +
 	"}";
-	var vertexShader = gl.createShader(gl.VERTEX_SHADER);
+	let vertexShader = gl.createShader(gl.VERTEX_SHADER);
+	this.free = function() {
+		gl.deleteShader(vertexShader);
+		gl.deleteBuffer(positionBuffer);
+		gl.deleteBuffer(textureBuffer);
+		gl.deleteBuffer(indexBuffer);
+	}
 	gl.shaderSource(vertexShader, vertexShaderCode);
 	gl.compileShader(vertexShader);
-	if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS))
+	if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)){
 		throw new Error(
 			"\nError: Vertex shader build failed\n" + "\n" +
 			"--- CODE DUMP ---\n" + vertexShaderCode + "\n\n" +
 			"--- ERROR LOG ---\n" + gl.getShaderInfoLog(vertexShader)
 		);
-	function createTexture(data, size, formats) {
-		var texture = gl.createTexture();
-		gl.bindTexture(gl.TEXTURE_2D, texture);
-		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-		console.log(size);
-		gl.texImage2D(gl.TEXTURE_2D, 0, formats.internal_format, size, size, 0, formats.format, formats.type, data);
-		gl.bindTexture(gl.TEXTURE_2D, null);
-		return texture;
 	}
-	function updateTexture(texture, size, formats, data){
-		gl.bindTexture(gl.TEXTURE_2D, texture);
-		gl.texImage2D(gl.TEXTURE_2D, 0, formats.internal_format, size, size, 0, formats.format, formats.type, data);
-		gl.bindTexture(gl.TEXTURE_2D, null);
-		return texture;
-	}
-	function Buffer(size, chnl=1, data=null){
-		this.length = size;
-		this.chnl = chnl;
-		this.formats = chnlMap[chnl];
-		this.mem = Math.pow(4, Math.ceil(Math.log(this.length) / Math.log(4)));
-		if (Math.sqrt(this.mem) > max_texture_size)
-			throw new Error("ERROR: Texture size not supported!");
-		this.data = new Float32Array(this.mem*this.chnl);
-		if(data && data.length){
-			for(var i=0;i<data.length;i++){
-				this.data[i] = data[i];
-			}
+	function Buffer(shape, arr = null){
+		let size = getShapedArraySize(shape);
+		this.shape = shape;
+		function createTexture(data, size) {
+			let texture = gl.createTexture();
+			return texture;
 		}
-		this.setData = function(nd, writeafter=false){
-			for(var i=0;i<this.length;i++){
-				this.data[i] = nd[i];
-			}
-			if(writeafter){
-				this.write();
-			}
+		function setTexture(texture, data, size) {
+			gl.bindTexture(gl.TEXTURE_2D, texture);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, size, size, 0, gl.RGBA, gl.FLOAT, data);
+			gl.bindTexture(gl.TEXTURE_2D, null);
+			return texture;
 		}
-		this.mem = Math.sqrt(this.mem);
+		if(!(size > 0)){
+			throw new Error("Buffer size must be > 0");
+		}
+		this.size = size;
+		this.texSize = getTexSize(size);
+		this.data = new Float32Array(this.texSize*this.texSize*4);
 		this.texture = null;
+		// this.mem = Math.pow(4, Math.ceil(Math.log(this.length) / Math.log(4)));
+		if (this.texSize > maxTextureSize){
+			throw new Error("ERROR: Texture size not supported!");
+		}
+		this.set = function(arr){
+			let flatArr = flattenArray(arr, this.shape);
+			// Verify size matches shape
+			if (flatArr.length !== this.size) {
+				throw new Error(`Array size ${flatArr.length} doesn't match buffer shape ${this.shape} (size ${this.size})`);
+			}
+			for(let i=0;i<Math.min(this.data.length, this.size);i++){
+				this.data[i] = flatArr[i];
+			}
+		}
+		if(arr){
+			this.set(arr);
+		}
 		this.alloc = function(){
-			if(this.texture == null)
-				this.texture = createTexture(this.data, this.mem, this.formats);
+			if(this.texture == null){
+				this.texture = createTexture(this.data, this.texSize);
+			}
+			setTexture(this.texture, this.data, this.texSize);
 			return this.texture;
 		}
-		this.write = function(){
-			if(this.texture == null)
-				this.alloc();
-			else
-				this.texture = updateTexture(this.texture, this.mem, this.formats, this.data);
-		}
-		this.read = function(){
-			if(this.texture == null) throw Error("Buffer not allocated in GPU");
-			var fb = gl.createFramebuffer();
-			gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-			gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture, 0);
-			if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) == gl.FRAMEBUFFER_COMPLETE) {
-				gl.readBuffer(gl.COLOR_ATTACHMENT0);
-				gl.readPixels(0, 0, this.mem, this.mem, this.formats.format, this.formats.type, this.data);
-			}
-			gl.deleteFramebuffer(fb);
-		}
-		this.delete = function(){
-			if(this.texture != null)
+		this.free = function(){
+			if(this.texture != null){
 				gl.deleteTexture(this.texture);
+			}
 			this.texture = null;
 		}
-		this.copyShader = function(buf, offset = 0, read=false){
-			if(gpu.log) console.log(this);
-			if(this.texture == null) throw Error("Buffer not allocated in GPU");
-			var cpyPrgm = `void main(void) {\n`;
-			for(var i=0;i<buf.length;i++){
-				cpyPrgm += `out${i} = readI(0, getIndex() + ${offset}. );\n`;
-			}
-			cpyPrgm += '}';
-			var prgm = gpu.Program([this],buf,cpyPrgm);
-			prgm.exec(read);
-			return buf;
-		}
-		this.draw = function(){
-			if(this.texture == null) throw Error("Buffer not allocated in GPU");
-			var cpyPrgm = `void main(void) {\n`;
-			for(var i=0;i<1;i++){
-				cpyPrgm += `out${i} = readIRGBA(0, getIndex() );\n`;
-			}
-			cpyPrgm += '}';
-			var prgm = gpu.Program([this],[this],cpyPrgm);
-			prgm.exec(false, null, true);
-		}
-		this.copy = function(bufs, read=false){
-			if(this.texture == null) throw Error("Buffer not allocated in GPU");
-			var fb = gl.createFramebuffer();
-			gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-			gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture, 0);
-			gl.readBuffer(gl.COLOR_ATTACHMENT0);
-			for(var i=0;i<bufs.length;i++){
-				var buf=bufs[i];
-				if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) == gl.FRAMEBUFFER_COMPLETE) {
-					gl.copyTexImage2D(gl.TEXTURE_2D, 0, buf.formats.internal_format, 0, 0, buf.mem, buf.mem, 0);
-					if(read)
-						gl.readPixels(0, 0, buf.mem, buf.mem, buf.formats.format, buf.formats.type, buf.data);
-				}
-			}
-			gl.deleteFramebuffer(fb);
-		}
-
-	}
-	function Program(inp, op, code){
-		this.inp = inp;
-		this.op = op;
-		if(inp.length +op.length > max_texture_units + max_color_units){
-			return false;
-		}
-		var sizeI = [];	
-		var texcode = 'uniform sampler2D u_texture['+this.inp.length+'];\n';
-		for(let i=0;i<this.inp.length; i++){
-			sizeI.push(this.inp[i].mem);
-		}
-		texcode += 'float size['+this.inp.length+'] = float[]('+sizeI.join('.,')+'.);\n';
-		var sizeO = this.op[0].mem;
-		var opcode = '';
-		var comcode = '';
-		for(let i=0;i<this.op.length;i++){
-			opcode += 'layout(location = '+i+') out '+this.op[i].formats.stype+' out'+i+';\n';
-			comcode += 'out'+i+' = op['+i+'];\n';
-		}
-		if(this.inp.length <= 0){
-			texcode = '';
-		}else{
-			texcode += `
-		float getR(int i, vec2 coord) {
-		  return texture(u_texture[i], coord).r;
-		}
-		float getG(int i, vec2 coord) {
-		  return texture(u_texture[i], coord).g;
-		}
-		float getB(int i, vec2 coord) {
-		  return texture(u_texture[i], coord).b;
-		}
-		float getA(int i, vec2 coord) {
-		  return texture(u_texture[i], coord).a;
-		}
-		vec2 getRG(int i, vec2 coord) {
-		  return texture(u_texture[i], coord).rg;
-		}
-		vec3 getRGB(int i, vec2 coord) {
-		  return texture(u_texture[i], coord).rgb;
-		}
-		vec4 getRGBA(int i, vec2 coord) {
-		  return texture(u_texture[i], coord).rgba;
-		}
-		vec2 getInd(int i, float index){
-   			float y = float(int(index)/int(size[i]));
-   			float x = index - size[i]*y;
-   			return vec2(x,y);
-   		}
-   		vec2 getPos(int i, vec2 ind){
-   			return (ind + 0.5)/size[i];
-   		}
-   		float readIR(int i, float index){
-   			return getR(i, getPos(i, getInd(i, index)));
-   		}
-   		float readI(int i, float index){
-   			return getR(i, getPos(i, getInd(i, index)));
-   		}
-   		float readIG(int i, float index){
-   			return getG(i, getPos(i, getInd(i, index)));
-   		}
-   		float readIB(int i, float index){
-   			return getB(i, getPos(i, getInd(i, index)));
-   		}
-   		float readIA(int i, float index){
-   			return getA(i, getPos(i, getInd(i, index)));
-   		}
-   		vec2 readIRG(int i, float index){
-   			return getRG(i, getPos(i, getInd(i, index)));
-   		}
-   		vec3 readIRGB(int i, float index){
-   			return getRGB(i, getPos(i, getInd(i, index)));
-   		}
-   		vec4 readIRGBA(int i, float index){
-   			return getRGBA(i, getPos(i, getInd(i, index)));
-   		}`
-		}
-		this.stdlib = `#version 300 es
-		precision mediump float;
-		float sizeO = ${sizeO}.;
-
-		in vec2 pos;
-		${opcode}
-		
-		vec2 indXY(){
-   			return pos*sizeO - 0.5 ;
-   		}
-   		float getIndex(){
-   			vec2 ind = indXY();
-   			return (ind.y*sizeO + ind.x);
-   		}
-
-   		${texcode}
-		`;
-		//console.log(this.stdlib);
-		var fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
-		this.fscode = code;
-		if(gpu.log) console.log(this.stdlib + this.fscode);
-		gl.shaderSource(
-			fragmentShader,
-			this.stdlib + this.fscode
-		);
-		var compiled = false;
-		this.compile = function(){
-			compiled = true;
-			gl.compileShader(fragmentShader);
-			if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) {
-				var LOC = code.split('\n');
-				var dbgMsg = "ERROR: Could not build shader (fatal).\n\n------------------ KERNEL CODE DUMP ------------------\n"
-				for (var nl = 0; nl < LOC.length; nl++)
-					dbgMsg += (this.stdlib.split('\n').length + nl) + "> " + LOC[nl] + "\n";
-				dbgMsg += "\n--------------------- ERROR  LOG ---------------------\n" + gl.getShaderInfoLog(fragmentShader)
-				throw new Error(dbgMsg);
-			}
-			this.program = gl.createProgram();
-			gl.attachShader(this.program, vertexShader);
-			gl.attachShader(this.program, fragmentShader);
-		}
-		if(settings.autocompile){
-			this.compile();
-		}
-		this.exec = function(doTransfer = false, transi = null, draw = false){
-			if(!compiled) throw new Error("Program not compiled!");
-			gl.linkProgram(this.program);
-			if (!gl.getProgramParameter(this.program, gl.LINK_STATUS))
-				throw new Error('ERROR: Can not link GLSL program!'+gl.LINK_STATUS);
-			var v_texture = [];
-			for(let i=0;i<this.inp.length;i++){
-				v_texture.push(gl.getUniformLocation(this.program, 'u_texture['+i+']'));
-			}
-			var aPosition = gl.getAttribLocation(this.program, 'position');
-			var aTexture = gl.getAttribLocation(this.program, 'texture');
-			gl.viewport(0, 0, sizeO, sizeO);
-			var fbo = gl.createFramebuffer();
-			if(!draw){
-				gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-				var colAt = [];
-				for(let i=0;i<this.op.length;i++){
-					if(this.op[i].texture == null) this.op[i].alloc();
-					gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0+i, gl.TEXTURE_2D, this.op[i].texture, 0);
-					colAt.push(gl.COLOR_ATTACHMENT0+i);
-				}
+		this.read = function() {
+			if (!this.texture) {
+				throw new Error("Texture not allocated on GPU");
 			}
 			
-			var frameBufferStatus = (gl.checkFramebufferStatus(gl.FRAMEBUFFER) == gl.FRAMEBUFFER_COMPLETE);
-			if (!frameBufferStatus)
-				throw new Error('ERROR: ' + frameBufferStatus.message);
+			// Create a framebuffer
+			const fbo = gl.createFramebuffer();
+			gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+			
+			// Attach the texture
+			gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture, 0);
+			
+			// Check if framebuffer is complete
+			const frameBufferStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+			if (frameBufferStatus !== gl.FRAMEBUFFER_COMPLETE) {
+				throw new Error('Framebuffer not complete: ' + getFrameBufferStatusMsg(frameBufferStatus));
+			}
+			
+			// Read the pixels
+			gl.readPixels(0, 0, this.texSize, this.texSize, gl.RGBA, gl.FLOAT, this.data);
+			
+			// Cleanup
+			gl.deleteFramebuffer(fbo);
+			
+			return this.data;
+		}
+		this.getShapedData = function(){
+			return unflattenArray(this.data, this.shape);
+		}
+	}
+	function Program(inpShapes, opShapes, code, pixel_code=''){
+		let inpSize = inpShapes.map(x => getShapedArraySize(x));
+		let opSize = opShapes.map(x => getShapedArraySize(x));
+		if(!(opSize.length > 0)){
+			throw new Error("output length >0 required");
+		}
+		if(inpSize.length > maxTextureUnits){
+			throw new Error("max input buffers supported = ", maxTextureUnits);
+		}
+		if(opSize.length > maxColorUnits){
+			throw new Error("max output buffers supported = ", maxColorUnits);
+		}
+
+		let sizeO = getTexSize(opSize[0]);
+		let fragmentShaderCode = `#version 300 es
+		precision highp float;
+		float _webcl_inpSize[${inpSize.length}] = float[](${inpSize.join('.,')}.);
+		float _webcl_opSize[${opSize.length}] = float[](${opSize.join('.,')}.);
+		// const float _webcl_outShape[${opShapes[0].length}] = float[](${opShapes[0].join('.,')}.);
+		${inpSize.length ? `float _webcl_sizeI[${inpSize.length}] = float[](${inpSize.map(x => getTexSize(x)+'.').join(',')});\nuniform sampler2D _webcl_uTexture[${inpSize.length}];` : ''}
+		float _webcl_sizeO = ${sizeO}.;
+		in vec2 _webcl_pos;
+        #define _webcl_getFlatIndex() (( (_webcl_pos.y*_webcl_sizeO - 0.5)*_webcl_sizeO + (_webcl_pos.x*_webcl_sizeO - 0.5) )*4. + _webcl_i)
+		${opSize.map((x,i) => `layout(location = ${i}) out vec4 _webcl_out${i};`).join('\n')}
+		
+		#define _webcl_readInFlat(n,i) texture(_webcl_uTexture[n], (0.5 + vec2(mod(floor(i/4.), _webcl_sizeI[n]), floor(floor(i/4.)/_webcl_sizeI[n])))/_webcl_sizeI[n])[int(mod(i, 4.))]
+		${inpSize.map((x,i) => `#define _webcl_readInFlat${i}(i) _webcl_readInFlat(${i},i)`).join('\n')}
+		${opSize.map((x,i) => `#define _webcl_commitFlat${i}(val) _webcl_out${i}[_webcl_I] = val * _webcl_mask`).join('\n')}
+		${inpShapes.map((x,i) => generateIndexMacro(x, 'In'+i)).join('\n')}
+		${generateIndexMacro(opShapes[0], 'Out')}
+		${inpShapes.map((x,i) => `#define _webcl_readIn${i}(${x.map((x,i) => 'x'+i).join(',')}) _webcl_readInFlat${i}(_webcl_getFlatIndexIn${i}(${x.map((x,i) => 'x'+i).join(',')}))`).join('\n')}
+		${opShapes.map((x,i) => `#define _webcl_commitOut${i}(val) _webcl_commitFlat${i}(val)`).join('\n')}
+		${generateShapedIndexMacro(opShapes[0], 'Out')}
+		${generateNextShapedIndexMacro(opShapes[0], 'Out')}
+		void main(void){
+			${pixel_code}
+			#define _webcl_i 0.
+			#define _webcl_I 0
+			float _webcl_index[${opShapes[0].length}];
+			float _webcl_flatIndex = floor(_webcl_getFlatIndex());
+			_webcl_getShapedIndexOut(_webcl_flatIndex, _webcl_index);
+			float _webcl_mask = step(_webcl_flatIndex+1., _webcl_opSize[0]);
+			{
+				${code}
+			}
+			#undef _webcl_i
+			#define _webcl_i 1.
+			#undef _webcl_I
+			#define _webcl_I 1
+			_webcl_flatIndex += 1.;
+			_webcl_nextShapedIndexOut(_webcl_index);
+			_webcl_mask *= step(_webcl_flatIndex+1., _webcl_opSize[0]);
+			{
+				${code}
+			}
+			#undef _webcl_i
+			#define _webcl_i 2.
+			#undef _webcl_I
+			#define _webcl_I 2
+			_webcl_flatIndex += 1.;
+			_webcl_nextShapedIndexOut(_webcl_index);
+			_webcl_mask *= step(_webcl_flatIndex+1., _webcl_opSize[0]);
+			{
+				${code}
+			}
+			#undef _webcl_i
+			#define _webcl_i 3.
+			#undef _webcl_I
+			#define _webcl_I 3
+			_webcl_flatIndex += 1.;
+			_webcl_nextShapedIndexOut(_webcl_index);
+			_webcl_mask *= step(_webcl_flatIndex+1., _webcl_opSize[0]);
+			{
+				${code}
+			}
+				
+		}
+		`;
+		console.log(vertexShaderCode);
+		console.log(fragmentShaderCode);
+		let fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+
+		gl.shaderSource(
+			fragmentShader,
+			fragmentShaderCode
+		);
+		gl.compileShader(fragmentShader);
+		if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) {
+			let LOC = (fragmentShaderCode).split('\n');
+			let dbgMsg = "ERROR: Could not build shader (fatal).\n\n------------------ KERNEL CODE DUMP ------------------\n"
+			for (let nl = 0; nl < LOC.length; nl++)
+				dbgMsg += (1 + nl) + "> " + LOC[nl] + "\n";
+			dbgMsg += "\n--------------------- ERROR  LOG ---------------------\n" + gl.getShaderInfoLog(fragmentShader)
+			throw new Error(dbgMsg);
+		}
+		let program = gl.createProgram();
+		gl.attachShader(program, vertexShader);
+		gl.attachShader(program, fragmentShader);
+
+
+		this.new = function(newInpSize, newOpSize){
+			return new Program(newInpSize, newOpSize, code);
+		}
+		let fbo = null;
+		this.exec = function(inp, op, transferOutput = false, transferIndices = null, previewIndex = 0){
+			gl.linkProgram(program);
+			if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+				throw new Error('ERROR: Can not link GLSL program!');
+			let v_texture = [];
+			for(let i=0;i<inp.length;i++){
+				v_texture.push(gl.getUniformLocation(program, '_webcl_uTexture['+i+']'));
+			}
+			let aPosition = gl.getAttribLocation(program, '_webcl_position');
+			let aTexture = gl.getAttribLocation(program, '_webcl_texture');
+			gl.viewport(0, 0, sizeO, sizeO);
+			fbo = fbo || gl.createFramebuffer();
+			gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+			let colAt = [];
+			for(let i=0;i<op.length;i++){
+				op[i].alloc();
+				gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0+i, gl.TEXTURE_2D, op[i].texture, 0);
+				colAt.push(gl.COLOR_ATTACHMENT0+i);
+			}
+			let frameBufferStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+			if (frameBufferStatus !== gl.FRAMEBUFFER_COMPLETE){
+				throw new Error('ERROR: ' + getFrameBufferStatusMsg(frameBufferStatus));
+			}
 			gl.bindBuffer(gl.ARRAY_BUFFER, textureBuffer);
 			gl.enableVertexAttribArray(aTexture);
 			gl.vertexAttribPointer(aTexture, 2, gl.FLOAT, false, 0, 0);
@@ -344,163 +415,65 @@ function GPU(ctx = null, log = false){
 			gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
 			gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
 
-			if(!draw) gl.drawBuffers(colAt);
+			gl.drawBuffers(colAt);
 
 
-			gl.useProgram(this.program);
-			for(let i=0;i<this.inp.length;i++){
+			gl.useProgram(program);
+			for(let i=0;i<inp.length;i++){
 				gl.activeTexture(gl.TEXTURE0+i);
-				gl.bindTexture(gl.TEXTURE_2D, this.inp[i].texture);
+				gl.bindTexture(gl.TEXTURE_2D, inp[i].texture);
 				gl.uniform1i(v_texture[i], i);
 			}
 			
 			gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
-			if(doTransfer){
-				if(transi === null){
-					for(let i=0;i<this.op.length;i++){
+			if(transferOutput){
+				if(transferIndices === null){
+					for(let i=0;i<op.length;i++){
 						gl.readBuffer(gl.COLOR_ATTACHMENT0+i);
-						gl.readPixels(0, 0, sizeO, sizeO, this.op[i].formats.format, this.op[i].formats.type, this.op[i].data);
+						// assuming a framebuffer is bound with the texture to read attached
+						// const format = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT);
+						// const type = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE);
+						// console.log(gl, format, type);
+						gl.readPixels(0, 0, sizeO, sizeO, gl.RGBA, gl.FLOAT, op[i].data);
 					}
 				}else{
-					var i = transi;
-					gl.readBuffer(gl.COLOR_ATTACHMENT0+i);
-					gl.readPixels(0, 0, sizeO, sizeO, this.op[i].formats.format, this.op[i].formats.type, this.op[i].data);
+					for(let i=0;i<transferIndices.length;i++){
+						gl.readBuffer(gl.COLOR_ATTACHMENT0+transferIndices[i]);
+						gl.readPixels(0, 0, sizeO, sizeO, gl.RGBA, gl.FLOAT, op[transferIndices[i]].data);
+					}
 				}
 			}
-			gl.deleteFramebuffer(fbo);
+			if(previewIndex !== null && previewIndex < op.length){
+				gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fbo);
+				gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+				gl.readBuffer(gl.COLOR_ATTACHMENT0 + previewIndex);
+
+				// gl.canvas.width = op[previewIndex].texSize;
+				// gl.canvas.height = op[previewIndex].texSize;
+				// console.log("canvas", gl.canvas.width, gl.canvas.height);
+				gl.blitFramebuffer(
+					0, 0, op[previewIndex].texSize, op[previewIndex].texSize,  // source
+					0, 0, gl.canvas.width, gl.canvas.height,                    // dest
+					gl.COLOR_BUFFER_BIT,
+					gl.NEAREST
+				);
+			}
+			
 		}
-		
+
+		this.free = function() {
+            gl.deleteProgram(program);
+            gl.deleteShader(fragmentShader);
+			gl.deleteFramebuffer(fbo);
+        }
 	}
 
-	this.Buffer = function(size, chnl, data){
-		return new Buffer(size, chnl, data);
+	this.Buffer = function(size, data){
+		return new Buffer(size, data);
 	}
 
 	this.Program = function(inp, op, code){
 		return new Program(inp, op, code);
 	}
+
 }
-
-function ExecGraph(){
-	// var shader = `
-	// #define inputBuffer 0
-	// #define paramBuffer 1
-	// #define outputBuffer 2
-	// `;
-	
-	var Activation = function(){
-		/*
-			dtype = 'int','float'
-		*/
-		this.stack = [];
-		this.shader = '';
-		this.operator = function(op,y,x,dtype){
-			return(dtype+' '+ y + ' op ' + x+';');
-		}
-		this.func = function(op, params){
-			return(op+"("+params.join(",")+");");
-		}
-		this.read = function(buffer, index, chnl = 1){
-			return('readIR('+buffer+', float('+index+'));');
-		}
-		this.write = function(index, val, chnl = 1){
-			return('out'+index+' = '+val+';');
-		}
-		this.push = function(act){
-			this.stack.push(act);
-			return this;
-		}
-		this.compile = function(){
-			this.shader = this.stack.join('');
-			return this.shader;
-		}
-	}
-
-	var Graph = function(activation, nodes){
-		this.nodes = nodes;
-		this.activation = activation;
-		var graph = this;
-		var gpu = new GPU();
-		var lenInp = 0;
-		var lenParam = 0;
-		var lenControl = 0;
-		var lenOut = nodes.length;
-		var lenCNodes = 0;
-		var paramBufferTmp = [];
-		var opBuffer = [];
-		for(var i=0;i<nodes.length;i++){
-			paramBufferTmp = paramBufferTmp.concat(nodes[i].params);
-			opBuffer.push(nodes[i].value);
-		}
-		var paramBuffer = gpu.Buffer(paramBufferTmp.length, 1, paramBufferTmp);
-		opBuffer = gpu.Buffer(opBuffer.length, 1, opBuffer);
-		var opBufferS = gpu.Buffer(opBuffer.length, 1, opBuffer);
-		var inpBufferTmp = [];
-		var inpBuffer = null;
-		var prog = [];
-		var inpBufs = null;
-		var swapInpBuf = 0;
-		opBuffer.alloc();
-		paramBuffer.alloc();
-		opBufferS.alloc();
-		this.addProg = function(inp){
-			inpBufs = [paramBuffer, opBuffer];
-			inpBufsS = [paramBuffer, opBufferS];
-			for(var i=0;i<inp.length;i++){
-				inpBufferTmp = inpBufferTmp.concat(inp[i]);
-			}
-			
-			if(inpBufferTmp.length > 0){
-				inpDim = inp[0].length;
-				inpBuffer = gpu.Buffer(inpBufferTmp.length, 1, inpBufferTmp);
-				inpBuffer.alloc();
-				inpBufs.push(inpBuffer);
-				inpBufsS.push(inpBuffer);
-			}else{
-				inpDim = 0;
-			}
-			var fshader = 
-			`void main(){
-				int INPUT = 2;
-				int PARAM = 0;
-				int OUT = 1;
-				${this.activation}
-			}`;
-			prog.push([gpu.Program(inpBufs, [opBufferS], fshader),gpu.Program(inpBufsS, [opBuffer], fshader)]);
-			console.log(prog);
-			this.exec = function(i=0, swap = true){
-				if(prog[i][swapInpBuf] == null) throw Error('Null Program');
-					else prog[i][swapInpBuf].exec();
-				if(swap){
-					graph.swap();
-				}
-			}
-			this.read = function(){
-				if(swapInpBuf){
-					opBufferS.read();
-					return opBufferS.data;
-				}else{
-					opBuffer.read();
-					return opBuffer.data;
-				}
-			}
-			this.swap = function(){
-				swapInpBuf = (swapInpBuf+1)%2;
-			}
-		}
-		
-		
-	}
-	this.Graph = function(activation, nodes){
-		return new Graph(activation, nodes);
-	}
-	this.Activation = function(){
-		return new Activation();
-	}
-}
-
-
-
-//GPU -> gives access to GPU
-//Buffer -> Memory in GPU and CPU, copy buffers on gpu
-//Program -> Program in GPU(init, compile, exec(link & exec))
